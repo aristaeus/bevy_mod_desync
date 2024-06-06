@@ -1,13 +1,14 @@
 use bevy_app::{App, First, Plugin};
 use bevy_ecs::{
     component::{Component, ComponentId},
-    entity::Entity,
+    entity::{Entity, EntityMapper},
     ptr::Ptr,
     system::Resource,
     world::World,
 };
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Bevy Plugin to detect desyncs
 pub struct DesyncPlugin {
@@ -16,22 +17,22 @@ pub struct DesyncPlugin {
     pub add_system: bool,
     /// Function for sorting entities before hashing. A default implementation which will likely
     /// trigger false positives is provided.
-    pub entity_sort: fn(&World) -> Vec<Entity>,
+    pub entity_sort: Arc<Box<dyn Fn(&World) -> Vec<Entity> + Send + Sync>>,
 }
 
 impl Default for DesyncPlugin {
     fn default() -> Self {
         DesyncPlugin {
             add_system: true,
-            entity_sort: sort_entities_ids,
+            entity_sort: Arc::new(Box::new(sort_entities_ids)),
         }
     }
 }
 
 impl Plugin for DesyncPlugin {
     fn build(&self, app: &mut App) {
-        app.insert_resource(DesyncDataRegistries {
-            entity_sort: self.entity_sort,
+        app.insert_resource(DesyncPluginData {
+            entity_sort: self.entity_sort.clone(),
             ..Default::default()
         })
         .init_resource::<Crc>();
@@ -48,21 +49,21 @@ impl Plugin for DesyncPlugin {
 pub struct Crc(pub u16);
 
 #[derive(Resource)]
-struct DesyncDataRegistries {
+pub struct DesyncPluginData {
     serialize_fn_registry: HashMap<ComponentId, unsafe fn(Ptr) -> String>,
-    entity_sort: fn(&World) -> Vec<Entity>,
+    pub entity_sort: Arc<Box<dyn Fn(&World) -> Vec<Entity> + Send + Sync>>,
 }
 
-impl Default for DesyncDataRegistries {
+impl Default for DesyncPluginData {
     fn default() -> Self {
-        DesyncDataRegistries {
+        DesyncPluginData {
             serialize_fn_registry: HashMap::default(),
-            entity_sort: sort_entities_ids,
+            entity_sort: Arc::new(Box::new(sort_entities_ids)),
         }
     }
 }
 
-impl DesyncDataRegistries {
+impl DesyncPluginData {
     fn serialize(&self, ptr: Ptr, id: &ComponentId) -> String {
         unsafe {
             // SAFETY: components match
@@ -91,7 +92,7 @@ pub trait AppDesyncExt {
 impl AppDesyncExt for App {
     fn track_desync<T: Component + Serialize>(&mut self) {
         let component_id = self.world.init_component::<T>();
-        let mut desync_data = self.world.resource_mut::<DesyncDataRegistries>();
+        let mut desync_data = self.world.resource_mut::<DesyncPluginData>();
         desync_data
             .serialize_fn_registry
             .insert(component_id, untyped_serialize::<T>);
@@ -104,10 +105,10 @@ unsafe fn untyped_serialize<T: Component + Serialize>(ptr: Ptr) -> String {
     serde_json::to_string(se).unwrap()
 }
 
-pub fn get_tracked_components(entity: Entity, world: &World) -> Vec<ComponentId> {
+fn get_tracked_components(entity: Entity, world: &World) -> Vec<ComponentId> {
     let entity = world.get_entity(entity).unwrap();
     let archetype = entity.archetype();
-    let desync_data = world.resource::<DesyncDataRegistries>();
+    let desync_data = world.resource::<DesyncPluginData>();
     let mut components = archetype
         .components()
         .filter(|c| desync_data.serialize_fn_registry.contains_key(c))
@@ -119,7 +120,7 @@ pub fn get_tracked_components(entity: Entity, world: &World) -> Vec<ComponentId>
 
 /// This method of calculating the CRC sorts archetypes, entities and components by their IDs. This
 /// may lead to false positives if the two worlds have different orders for those IDs.
-fn sort_entities_ids(world: &World) -> Vec<Entity> {
+pub fn sort_entities_ids(world: &World) -> Vec<Entity> {
     let track_desync_component_id = world.component_id::<TrackDesync>().unwrap();
     let mut archetypes = world
         .archetypes()
@@ -141,9 +142,50 @@ fn sort_entities_ids(world: &World) -> Vec<Entity> {
         .collect()
 }
 
+pub trait EnumerateEntities: EntityMapper {
+    /// Get all the entities mapped by this mapper
+    fn iter_entities(&self) -> Vec<(Entity, Entity)>;
+}
+
+/// Sort entities based on an entity map
+///
+/// Usage:
+/// ```rust,ignore
+/// app.add_plugins(
+/// DesyncPlugin {
+///     entity_sort: Arc::new(Box::new(|w| sort_from_entity_map::<MyEntityMapperType>(w, true))),
+///     ..Default::default()
+/// })
+/// ```
+///
+/// EntityMapper requires clone because this function requires read only access to the world
+pub fn sort_from_entity_map<Mapper: EnumerateEntities + Resource + Clone>(
+    world: &World,
+    from_self: bool,
+) -> Vec<Entity> {
+    let mut entity_map = world.get_resource::<Mapper>().unwrap().clone();
+    let entities = world
+        .iter_entities()
+        .filter(|entity| entity.contains::<TrackDesync>())
+        .map(|e| e.id());
+    if from_self {
+        let mut entities = entities.collect::<Vec<_>>();
+        entities.sort_by(|a, b| a.cmp(&b));
+        entities
+    } else {
+        // invert entity mapper
+        let mut entities = entity_map.iter_entities();
+        entities.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        entities
+            .iter()
+            .map(|e| entity_map.map_entity(e.0))
+            .collect()
+    }
+}
+
 pub fn calculate_crc(world: &World) -> u16 {
     let mut crc_input = String::new();
-    let desync_data = world.resource::<DesyncDataRegistries>();
+    let desync_data = world.resource::<DesyncPluginData>();
     let entities = (desync_data.entity_sort)(world);
     for entity in entities.iter() {
         let components = get_tracked_components(*entity, world);
@@ -169,6 +211,8 @@ pub fn update_crc(world: &mut World) {
 
 #[cfg(test)]
 mod tests {
+    use bevy_ecs::entity::EntityHashMap;
+
     use super::*;
 
     #[derive(Component, Serialize)]
@@ -209,19 +253,64 @@ mod tests {
         assert_ne!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
     }
 
+    #[derive(Clone, Default, Resource)]
+    struct EntityMap {
+        entity_map: EntityHashMap<Entity>,
+    }
+
+    impl EntityMapper for EntityMap {
+        fn map_entity(&mut self, entity: Entity) -> Entity {
+            *self.entity_map.get(&entity).unwrap()
+        }
+    }
+
+    impl EnumerateEntities for EntityMap {
+        fn iter_entities(&self) -> Vec<(Entity, Entity)> {
+            self.entity_map.iter().map(|(a, b)| (*a, *b)).collect()
+        }
+    }
+
     #[test]
-    fn entity_spawn_order() {
+    fn entity_mapping_sync_and_desync() {
         let mut app_1 = build_app();
         let mut app_2 = build_app();
-        app_1.world.spawn((Foo(0), TrackDesync));
-        app_1.world.spawn((Foo(1), TrackDesync));
-        app_2.world.spawn((Foo(1), TrackDesync));
-        app_2.world.spawn((Foo(0), TrackDesync));
+        let foo_1_0 = app_1.world.spawn((Foo(0), TrackDesync)).id();
+        let foo_1_1 = app_1.world.spawn((Foo(1), TrackDesync)).id();
+        let foo_2_1 = app_2.world.spawn((Foo(1), TrackDesync)).id();
+        let foo_2_0 = app_2.world.spawn((Foo(0), TrackDesync)).id();
 
         // calculate crc
         app_1.update();
         app_2.update();
 
+        // because entities were spawned in a different order, these checksums don't match
+        assert_ne!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
+        let mut entity_map = EntityHashMap::default();
+        entity_map.insert(foo_1_0, foo_2_0);
+        entity_map.insert(foo_1_1, foo_2_1);
+
+        // switch to using the entity map instead
+        app_1.world.insert_resource(EntityMap {
+            entity_map: entity_map.clone(),
+        });
+        app_1.world.resource_mut::<DesyncPluginData>().entity_sort =
+            Arc::new(Box::new(|w| sort_from_entity_map::<EntityMap>(w, true)));
+        app_2.world.insert_resource(EntityMap {
+            entity_map: entity_map.clone(),
+        });
+        app_2.world.resource_mut::<DesyncPluginData>().entity_sort =
+            Arc::new(Box::new(|w| sort_from_entity_map::<EntityMap>(w, false)));
+
+        // checksums now match
+        app_1.update();
+        app_2.update();
         assert_eq!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
+
+        // oh no, desync!
+        *app_1.world.get_mut::<Foo>(foo_1_0).unwrap() = Foo(2);
+
+        app_1.update();
+        app_2.update();
+        assert_ne!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
     }
 }

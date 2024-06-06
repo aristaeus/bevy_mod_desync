@@ -8,7 +8,7 @@ This provides a way of tracking whether determinism is achieved when running a B
 This crate provides a bevy `Plugin` which creates a resource and adds a single system. The resource, `Crc`, contains the [Cyclic Redundancy Check](https://en.wikipedia.org/wiki/Cyclic_redundancy_check) of the Bevy `World`. This is updated at the start of every tick. It is up to you to check whether this hash matches what you expect. Entities must be marked for desync tracking with the `TrackDesync` component. Components must be registered for tracking with `app.track_desync::<C>()`, and implement `Serialize`
 
 ### Usage
-Taken from the crate tests.
+Taken from the crate tests. This demonstrates using a custom `EntityMapper` for sorting entities to prevent false positives.
 ```rust
 fn build_app() -> App {
     let mut app = App::new();
@@ -17,29 +17,53 @@ fn build_app() -> App {
     app
 }
 
-fn detect_sync() {
-    let mut app_1 = build_app();
-    let mut app_2 = build_app();
-    app_1.world.spawn((Foo(0), TrackDesync));
-    app_2.world.spawn((Foo(0), TrackDesync));
-
-    // calculate crc
-    app_1.update();
-    app_2.update();
-
-    assert_eq!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
+#[derive(Clone, Default, Resource)]
+struct EntityMap {
+    entity_map: bevy_ecs::entity::EntityHashMap<Entity>,
 }
 
-fn detect_desync() {
+// other trait impls...
+
+fn entity_mapping_sync_and_desync() {
     let mut app_1 = build_app();
     let mut app_2 = build_app();
-    app_1.world.spawn((Foo(0), TrackDesync));
-    app_2.world.spawn((Foo(1), TrackDesync));
+    let foo_1_0 = app_1.world.spawn((Foo(0), TrackDesync)).id();
+    let foo_1_1 = app_1.world.spawn((Foo(1), TrackDesync)).id();
+    let foo_2_1 = app_2.world.spawn((Foo(1), TrackDesync)).id();
+    let foo_2_0 = app_2.world.spawn((Foo(0), TrackDesync)).id();
 
     // calculate crc
     app_1.update();
     app_2.update();
 
+    // because entities were spawned in a different order, these checksums don't match
+    assert_ne!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
+    let mut entity_map = bevy_ecs::entity::EntityHashMap::default();
+    entity_map.insert(foo_1_0, foo_2_0);
+    entity_map.insert(foo_1_1, foo_2_1);
+
+    // switch to using the entity map instead
+    app_1.world.insert_resource(EntityMap {
+        entity_map: entity_map.clone(),
+    });
+    app_1.world.resource_mut::<DesyncPluginData>().entity_sort =
+        Arc::new(Box::new(|w| sort_from_entity_map::<EntityMap>(w, true)));
+    app_2.world.insert_resource(EntityMap {
+        entity_map: entity_map.clone(),
+    });
+    app_2.world.resource_mut::<DesyncPluginData>().entity_sort =
+        Arc::new(Box::new(|w| sort_from_entity_map::<EntityMap>(w, false)));
+
+    // checksums now match
+    app_1.update();
+    app_2.update();
+    assert_eq!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
+
+    // oh no, desync!
+    *app_1.world.get_mut::<Foo>(foo_1_0).unwrap() = Foo(2);
+
+    app_1.update();
+    app_2.update();
     assert_ne!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
 }
 ```
