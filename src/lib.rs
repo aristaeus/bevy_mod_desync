@@ -1,6 +1,7 @@
 use bevy_app::{App, First, Plugin};
 use bevy_ecs::{
     component::{Component, ComponentId},
+    entity::Entity,
     ptr::Ptr,
     system::Resource,
     world::World,
@@ -10,19 +11,30 @@ use std::collections::HashMap;
 
 /// Bevy Plugin to detect desyncs
 pub struct DesyncPlugin {
+    /// Whether to add the update_crc system. Set to false if you want to add this yourself to
+    /// control execution
     pub add_system: bool,
+    /// Function for sorting entities before hashing. A default implementation which will likely
+    /// trigger false positives is provided.
+    pub entity_sort: fn(&World) -> Vec<Entity>,
 }
 
 impl Default for DesyncPlugin {
     fn default() -> Self {
-        DesyncPlugin { add_system: true }
+        DesyncPlugin {
+            add_system: true,
+            entity_sort: sort_entities_ids,
+        }
     }
 }
 
 impl Plugin for DesyncPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<DesyncDataRegistries>()
-            .init_resource::<Crc>();
+        app.insert_resource(DesyncDataRegistries {
+            entity_sort: self.entity_sort,
+            ..Default::default()
+        })
+        .init_resource::<Crc>();
         app.world.init_component::<TrackDesync>();
 
         if self.add_system {
@@ -35,9 +47,19 @@ impl Plugin for DesyncPlugin {
 #[derive(Debug, Default, PartialEq, Resource)]
 pub struct Crc(pub u16);
 
-#[derive(Default, Resource)]
+#[derive(Resource)]
 struct DesyncDataRegistries {
     serialize_fn_registry: HashMap<ComponentId, unsafe fn(Ptr) -> String>,
+    entity_sort: fn(&World) -> Vec<Entity>,
+}
+
+impl Default for DesyncDataRegistries {
+    fn default() -> Self {
+        DesyncDataRegistries {
+            serialize_fn_registry: HashMap::default(),
+            entity_sort: sort_entities_ids,
+        }
+    }
 }
 
 impl DesyncDataRegistries {
@@ -82,12 +104,23 @@ unsafe fn untyped_serialize<T: Component + Serialize>(ptr: Ptr) -> String {
     serde_json::to_string(se).unwrap()
 }
 
+pub fn get_tracked_components(entity: Entity, world: &World) -> Vec<ComponentId> {
+    let entity = world.get_entity(entity).unwrap();
+    let archetype = entity.archetype();
+    let desync_data = world.resource::<DesyncDataRegistries>();
+    let mut components = archetype
+        .components()
+        .filter(|c| desync_data.serialize_fn_registry.contains_key(c))
+        .collect::<Vec<_>>();
+    // TODO: component IDs aren't stable, think of a better way to sort
+    components.sort();
+    components
+}
+
 /// This method of calculating the CRC sorts archetypes, entities and components by their IDs. This
 /// may lead to false positives if the two worlds have different orders for those IDs.
-pub fn calculate_crc(world: &mut World) -> u16 {
-    let mut crc_input = String::new();
+fn sort_entities_ids(world: &World) -> Vec<Entity> {
     let track_desync_component_id = world.component_id::<TrackDesync>().unwrap();
-    let desync_data = world.resource::<DesyncDataRegistries>();
     let mut archetypes = world
         .archetypes()
         .iter()
@@ -97,23 +130,30 @@ pub fn calculate_crc(world: &mut World) -> u16 {
     // TODO: archetype IDs aren't stable, think of a better way to sort
     archetypes.sort_by(|a, b| a.id().cmp(&b.id()));
 
-    for archetype in archetypes {
-        let mut tracked_components = archetype
-            .components()
-            // components registered for tracking
-            .filter(|c| desync_data.serialize_fn_registry.contains_key(c))
-            .collect::<Vec<_>>();
-        // TODO: component IDs aren't stable, think of a better way to sort
-        tracked_components.sort();
-        let mut entities = archetype.entities().iter().collect::<Vec<_>>();
-        // TODO: entity IDs aren't stable, think of a better way to sort
-        entities.sort_by(|a, b| a.id().cmp(&b.id()));
-        for e in entities.iter() {
-            let e = world.entity(e.id());
-            for c in tracked_components.iter() {
-                let ptr = world.get_by_id(e.id(), *c).unwrap();
-                crc_input.push_str(&desync_data.serialize(ptr, c));
-            }
+    archetypes
+        .iter()
+        .flat_map(|archetype| {
+            let mut entities = archetype.entities().iter().collect::<Vec<_>>();
+            // TODO: entity IDs aren't stable, think of a better way to sort
+            entities.sort_by(|a, b| a.id().cmp(&b.id()));
+            entities.iter().map(|e| e.id()).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+pub fn calculate_crc(world: &World) -> u16 {
+    let mut crc_input = String::new();
+    let desync_data = world.resource::<DesyncDataRegistries>();
+    let entities = (desync_data.entity_sort)(world);
+    for entity in entities.iter() {
+        let components = get_tracked_components(*entity, world);
+        // check has tracking
+        if !world.get_entity(*entity).unwrap().contains::<TrackDesync>() {
+            continue;
+        }
+        for c in components.iter() {
+            let ptr = world.get_by_id(*entity, *c).unwrap();
+            crc_input.push_str(&desync_data.serialize(ptr, c));
         }
     }
 
@@ -167,5 +207,21 @@ mod tests {
         app_2.update();
 
         assert_ne!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
+    }
+
+    #[test]
+    fn entity_spawn_order() {
+        let mut app_1 = build_app();
+        let mut app_2 = build_app();
+        app_1.world.spawn((Foo(0), TrackDesync));
+        app_1.world.spawn((Foo(1), TrackDesync));
+        app_2.world.spawn((Foo(1), TrackDesync));
+        app_2.world.spawn((Foo(0), TrackDesync));
+
+        // calculate crc
+        app_1.update();
+        app_2.update();
+
+        assert_eq!(app_1.world.resource::<Crc>(), app_2.world.resource::<Crc>());
     }
 }

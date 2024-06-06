@@ -45,7 +45,7 @@ fn detect_desync() {
 ```
 
 ### Caveats
-This has not yet been tested in a real world app, and will likely trigger a lot of false positives. In an attempt to make hashing deterministic, archetypes, entities and components are sorted by ID before serialization - however I don't think Bevy offers any guarantees on determinism there. 
+This has not yet been tested in a real world app, and will likely trigger a lot of false positives. In an attempt to make hashing deterministic, archetypes, entities and components are sorted by ID before serialization - however I don't think Bevy offers any guarantees on determinism there. Users with a way to enforce entity sorting (e.g. a multiplayer game with a complete `EntityMapper` can provide a `fn(&World) -> Vec<Entity>` that has a canonical ordering for full determinism.
 
 ## Open Questions
 * Is `First` early enough in the schedule? How can we best guarantee the hashing runs at the same time every frame?
